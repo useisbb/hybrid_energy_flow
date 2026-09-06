@@ -194,16 +194,28 @@ class HybridInverter:
         pv_excess2bat = max(surplus, 0.0) - pv_export    # 超馈网上限的富余 → 电池消纳
 
         # ---- 电池功率分量（正=放电，负=充电）
+        # 提示词“第二张图”模式设置公式：
+        #   充电：电池设置=∞(不直接限制，光伏可突破计划充电)，电网部分受取电上限约束；
+        #   待机：电池设置=∞(不从电网取电充，仅光伏充电)；
+        #   放电：电池设置=TOU计划功率(直接放电)，计划内富余可馈网但不突破计划。
         d = 0.0                                 # 放电分量（不突破 TOU 放电计划）
         if plan > 0 and can_discharge:
-            d = min(plan_mag, deficit)          # 仅补负载缺口；富余时 d 自然为 0
+            export_room = 0.0 if F is None else max(F - pv_export, 0.0)  # 剩余馈网空间
+            if F is None:
+                room = plan_mag                 # 馈网不限：按计划全额放电
+            else:
+                room = deficit + export_room    # 补负载缺口 + 馈网空间
+            d = min(plan_mag, room)
+            if pv_excess2bat > 0.0:             # 光伏富余(超馈网)不与放电并存，只补缺口
+                d = min(d, deficit)
+        d = min(d, self.battery_discharge_limit_kw)
 
         c_pv, c_grid = 0.0, 0.0
         # 光伏消纳(超馈网上限的富余)可充电，优先级高于 TOU 计划（充/放/待机均适用）
         absorb = pv_excess2bat > 0.0 and can_charge
         if absorb:
             c_pv = min(pv_excess2bat, self.battery_charge_limit_kw)
-        if plan < 0 and can_charge:             # TOU 充电计划
+        if plan < 0 and can_charge:             # TOU 充电计划（电池从电网取电，受取电上限）
             need = max(plan_mag - c_pv, 0.0)    # 光伏已充不足部分
             if need > 0:
                 if I is None:
@@ -211,7 +223,6 @@ class HybridInverter:
                 else:
                     load_imp = max(deficit - d, 0.0)    # 负载缺口需从电网取的功率
                     c_grid = min(need, max(I - load_imp, 0.0))  # 优先保证取电≤上限
-        b = d - (c_pv + c_grid)
 
         # ---- 交流平衡 out + g = load；out 含 整流充电(负)、放电(正)
         a_use = pv_to_load + pv_export + c_pv          # 光伏实际利用(负载+馈网+充电池)
@@ -223,16 +234,20 @@ class HybridInverter:
         # 逆变限幅：富余过大且电池无法吸收时弃光；整流充电不超过逆变能力
         if out > inv_max:
             red = out - inv_max
-            red_export = min(pv_export, red)
+            red_export = min(pv_export, red)     # 先削减馈网光伏
             pv_export -= red_export
             a_use -= red_export
-            red_pv = red - red_export
-            c_pv = max(c_pv - red_pv, 0.0)     # 仍有富余可再充电（受容量限制则弃光）
+            red_rest = red - red_export
+            red_dis = min(d, red_rest)           # 再削减放电（电池馈网部分）
+            d -= red_dis
+            red_rest -= red_dis
+            c_pv = max(c_pv - red_rest, 0.0)     # 仍超出则由电池充电/弃光消纳
             a_use = max(pv_to_load + pv_export + c_pv, 0.0)
             out = pv_to_load + pv_export + d - c_grid
         if out < -inv_max:
             c_grid = min(c_grid, inv_max + pv_to_load + pv_export + d)
             out = pv_to_load + pv_export + d - c_grid
+        b = d - (c_pv + c_grid)                  # 电池净功率（正放负充），限幅后重算
 
         # ---- 电网交换：g>0 取电(购电)，g<0 馈网
         g = l - out
@@ -240,7 +255,12 @@ class HybridInverter:
         if I is not None and g > I:
             unmet = g - I                      # 负载缺供(取电上限内优先保负载)
             g = I
+        if F is not None and g < -F:           # 馈网不超过上限（防逆流时 F=0）
+            g = -F
         curtail = max(a0 - a_use, 0.0)
+
+        # 电池“设置功率”（提示词公式）：放电=TOU计划功率但不超过1倍额定；充电/待机=∞(无直接命令，置 NaN 表示)
+        battery_set_kw = min(plan, self.battery_rated_kw) if plan > 0 else float("nan")
 
         # ---- 状态/电能更新
         self._stored_kwh = float(np.clip(
@@ -264,6 +284,7 @@ class HybridInverter:
         return {
             "pv_avail_kw": a0, "pv_used_kw": a_use,
             "battery_pw_kw": b, "battery_cmd_kw": float("nan") if cmd is None else plan,
+            "battery_set_kw": battery_set_kw,
             "inverter_pw_kw": out, "inverter_set_kw": inv_set,
             "inv_cap_kw": inv_max,           # 逆变口功率限制(额定/可设定限制)
             "grid_pw_kw": g, "load_kw": l,
@@ -332,7 +353,7 @@ class HybridInverter:
         inv["逆变设置功率(kW)"] = np.round(r["inverter_set_kw"], 3)
         bat = build("battery_pw_kw", "bat_fwd_kwh", "bat_rev_kwh", "soc")
         bat = bat.rename(columns={P: "电池功率(kW)", "soc": "储能SOC(%)"})
-        bat["电池设置功率(kW)"] = np.round(r["battery_cmd_kw"], 2)
+        bat["电池设置功率(kW)"] = np.round(r["battery_set_kw"], 2)
         grid = build("grid_pw_kw", "grid_fwd_kwh", "grid_rev_kwh")
         grid = grid.rename(columns={P: "电网功率(kW)"})
         pv = pd.DataFrame({
