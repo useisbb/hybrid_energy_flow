@@ -169,97 +169,88 @@ class HybridInverter:
             cmd = None                                            # 非有限指令 -> 交由自动策略
         inv_max = self.inv_power_limit_kw
 
-        # ================= EMS 混逆执行策略（按 提示词.md） =================
-        # F: 馈网(卖电)功率上限 export_limit_kw；None=不限卖；0=防逆流(不馈网)
-        # I: 电网最大取电功率 grid_import_limit_kw；None=不限；0=不从电网取电
+        # ================= EMS 混逆执行策略（按 提示词.md 修改后语义） =================
+        # F: 馈网(卖电)上限 export_limit_kw；0=防逆流(不馈网)；None=不限(受逆变额定约束)
+        # I: 电网最大取电功率 grid_import_limit_kw；0=不从电网取电
+        # 控制优先级（提示词.md）：
+        #   SOC 到上/下限保护时电池功率清零；
+        #   光伏供给优先级 负载 > 电池充电 > 电网馈网；
+        #   电池充电电源优先级 光伏 > 电网；馈网电能优先级 光伏 > 电池；
+        #   光伏消纳 > TOU 计划（充/放/待机均适用，富余削减计划放电、可反转为充电，
+        #   最大充电功率 1 倍额定）；TOU 放电不突破计划；总取电(负载+充电) ≤ I。
         F = self.export_limit_kw
         I = self.grid_import_limit_kw
         plan = 0.0 if cmd is None else float(cmd)
         plan_mag = abs(plan)
+        inv_max = self.inv_power_limit_kw
 
-        # SOC 末端保护：到上/下限触发保护时电池功率清零
-        can_discharge = self.soc > self.soc_min + 1e-9
-        can_charge = self.soc < self.soc_max - 1e-9
+        b_min, b_max = self._clamp_battery(dt_h)     # 本步电池允许范围（负=充，正=放）
+        chg_cap = max(-b_min, 0.0)                   # 充电能力（≤1 倍额定 + SOC 余量）
+        dis_cap = max(b_max, 0.0)                    # 放电能力
 
-        surplus = a0 - l                        # >0 = 光伏富余
-        deficit = max(-surplus, 0.0)            # 负载缺口
+        # ---- 光伏分配（优先级：负载 → 电池充电 → 电网馈网）
+        pv_to_load = min(a0, l)                      # 1) 供本地负载
+        surplus = max(a0 - l, 0.0)                   #    负载外富余
+        deficit = max(l - a0, 0.0)                   #    负载缺口（光伏不足）
 
-        # 光伏供给优先级：负载 → 馈网(≤F) → 电池
-        pv_to_load = min(a0, l)                 # 光伏供本地负载
-        inv_head = max(inv_max - pv_to_load, 0.0)   # 供负载后逆变剩余 AC 能力
-        export_desired = max(surplus, 0.0)
-        if F is not None:
-            export_desired = min(export_desired, F)
-        pv_export = min(export_desired, inv_head)       # 实际可馈网的光伏
-        pv_excess2bat = max(surplus, 0.0) - pv_export    # 超馈网上限的富余 → 电池消纳
+        c_pv = min(surplus, chg_cap)                 # 2) 富余充电池（可突破 TOU 计划，≤1 倍额定）
+        pv_left = surplus - c_pv                     #    充后仍富余 → 馈网/弃光
+        export_cap = inv_max if F is None else min(inv_max, max(F, 0.0))
+        pv_export = min(pv_left, export_cap)         # 3) 富余馈网（≤F、≤逆变能力）
 
-        # ---- 电池功率分量（正=放电，负=充电）
-        # 提示词“第二张图”模式设置公式：
-        #   充电：电池设置=∞(不直接限制，光伏可突破计划充电)，电网部分受取电上限约束；
-        #   待机：电池设置=∞(不从电网取电充，仅光伏充电)；
-        #   放电：电池设置=TOU计划功率(直接放电)，计划内富余可馈网但不突破计划。
-        d = 0.0                                 # 放电分量（不突破 TOU 放电计划）
-        if plan > 0 and can_discharge:
-            export_room = 0.0 if F is None else max(F - pv_export, 0.0)  # 剩余馈网空间
+        # ---- 电池放电（仅光伏无富余时按 TOU 计划执行；不突破计划，计划内可馈网 ≤F）
+        d = 0.0
+        if plan > 0.0 and surplus <= 0.0 and dis_cap > 0.0:
             if F is None:
-                room = plan_mag                 # 馈网不限：按计划全额放电
+                room = plan_mag                      # 无馈网上限：按计划全额放电
             else:
-                room = deficit + export_room    # 补负载缺口 + 馈网空间
-            d = min(plan_mag, room)
-            if pv_excess2bat > 0.0:             # 光伏富余(超馈网)不与放电并存，只补缺口
-                d = min(d, deficit)
-        d = min(d, self.battery_discharge_limit_kw)
+                room = deficit + max(F, 0.0)         # 补负载缺口 + 计划内馈网空间(≤F)
+            d = min(plan_mag, room, dis_cap)
 
-        c_pv, c_grid = 0.0, 0.0
-        # 光伏消纳(超馈网上限的富余)可充电，优先级高于 TOU 计划（充/放/待机均适用）
-        absorb = pv_excess2bat > 0.0 and can_charge
-        if absorb:
-            c_pv = min(pv_excess2bat, self.battery_charge_limit_kw)
-        if plan < 0 and can_charge:             # TOU 充电计划（电池从电网取电，受取电上限）
-            need = max(plan_mag - c_pv, 0.0)    # 光伏已充不足部分
-            if need > 0:
+        # ---- TOU 充电计划：光伏已充后不足部分由电网补足；总取电(负载+充电) ≤ I
+        c_grid = 0.0
+        if plan < 0.0 and chg_cap > 0.0:
+            need_grid_chg = max(plan_mag - c_pv, 0.0)   # 光伏已充后仍需电网部分
+            if need_grid_chg > 0.0:
+                load_imp = max(deficit - d, 0.0)        # 放电后负载仍缺（电网供电）
                 if I is None:
-                    c_grid = need               # 充电优先级 光伏>电网
+                    c_grid = need_grid_chg              # 充电电源优先级 光伏>电网
                 else:
-                    load_imp = max(deficit - d, 0.0)    # 负载缺口需从电网取的功率
-                    c_grid = min(need, max(I - load_imp, 0.0))  # 优先保证取电≤上限
+                    c_grid = min(need_grid_chg, max(I - load_imp, 0.0))
 
-        # ---- 交流平衡 out + g = load；out 含 整流充电(负)、放电(正)
-        a_use = pv_to_load + pv_export + c_pv          # 光伏实际利用(负载+馈网+充电池)
-        out = pv_to_load + pv_export + d - c_grid
-        # 逆变设置功率(EMS 目标 AC 出力，未计限幅修正；供 设置 vs 实际 对比)
-        inv_set = pv_to_load + min(max(surplus, 0.0),
-                                   F if F is not None else inv_max) + d - c_grid
-        inv_set = float(np.clip(inv_set, -inv_max, inv_max))
-        # 逆变限幅：富余过大且电池无法吸收时弃光；整流充电不超过逆变能力
+        # ---- 交流功率平衡（逆变口口径 = 光伏实际 + 电池净，负 = 整流充电）
+        a_use = pv_to_load + pv_export + c_pv          # 光伏实际利用（负载+馈网+充电池）
+        out = pv_to_load + pv_export + d - c_grid      # 逆变口净送出（含整流充电）
+        inv_set = float(np.clip(out, -inv_max, inv_max))   # EMS 目标 AC 出力（限幅前）
+        # 逆变限幅：AC 输出过高先削光伏馈网→削放电→削充电消纳(弃光)；整流充电不超逆变能力
         if out > inv_max:
             red = out - inv_max
-            red_export = min(pv_export, red)     # 先削减馈网光伏
+            red_export = min(pv_export, red)           # 先削减光伏馈网（保负载/保充电）
             pv_export -= red_export
             a_use -= red_export
             red_rest = red - red_export
-            red_dis = min(d, red_rest)           # 再削减放电（电池馈网部分）
+            red_dis = min(d, red_rest)                 # 再削减电池放电
             d -= red_dis
             red_rest -= red_dis
-            c_pv = max(c_pv - red_rest, 0.0)     # 仍超出则由电池充电/弃光消纳
+            c_pv = max(c_pv - red_rest, 0.0)           # 仍超出→削减充电/弃光消纳
             a_use = max(pv_to_load + pv_export + c_pv, 0.0)
             out = pv_to_load + pv_export + d - c_grid
         if out < -inv_max:
             c_grid = min(c_grid, inv_max + pv_to_load + pv_export + d)
             out = pv_to_load + pv_export + d - c_grid
-        b = d - (c_pv + c_grid)                  # 电池净功率（正放负充），限幅后重算
+        b = d - (c_pv + c_grid)                        # 电池净功率（正放负充），限幅后重算
 
         # ---- 电网交换：g>0 取电(购电)，g<0 馈网
         g = l - out
         unmet = 0.0
         if I is not None and g > I:
-            unmet = g - I                      # 负载缺供(取电上限内优先保负载)
+            unmet = g - I                              # 负载缺供(取电上限内优先保负载)
             g = I
-        if F is not None and g < -F:           # 馈网不超过上限（防逆流时 F=0）
+        if F is not None and g < -F:                   # 馈网不超过上限（防逆流时 F=0）
             g = -F
         curtail = max(a0 - a_use, 0.0)
 
-        # 电池“设置功率”（提示词公式）：放电=TOU计划功率但不超过1倍额定；充电/待机=∞(无直接命令，置 NaN 表示)
+        # 电池“设置功率”（提示词公式）：放电=TOU计划功率(≤1倍额定)；充电/待机=∞(置 NaN 断线)
         battery_set_kw = min(plan, self.battery_rated_kw) if plan > 0 else float("nan")
 
         # ---- 状态/电能更新
