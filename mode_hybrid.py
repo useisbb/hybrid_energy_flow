@@ -176,8 +176,8 @@ class HybridInverter:
         # I: 电网最大取电功率 grid_import_limit_kw；0=不从电网取电
         # 控制优先级（提示词.md）：
         #   SOC 到上/下限保护时电池功率清零；
-        #   光伏供给优先级 负载 > 电池充电 > 电网馈网；
-        #   储能充满(无充电余量)前富余不馈网（弃光），充满后余电才馈网 ≤F；
+        #   光伏供给优先级 负载 > 电网馈网 > 电池充电；
+        #   富余先馈网(≤F、≤逆变额定)，超出馈网上限/防逆流时的富余再充电池（≤1 倍额定）；
         #   电池充电电源优先级 光伏 > 电网；馈网电能优先级 光伏 > 电池；
         #   光伏消纳 > TOU 计划（充/放/待机均适用，富余削减计划放电、可反转为充电，
         #   最大充电功率 1 倍额定）；TOU 放电不突破计划；总取电(负载+充电) ≤ I。
@@ -191,7 +191,7 @@ class HybridInverter:
         chg_cap = max(-b_min, 0.0)                   # 充电能力（≤1 倍额定 + SOC 余量）
         dis_cap = max(b_max, 0.0)                    # 放电能力
 
-        # ---- 光伏分配（优先级：负载 → 电池充电 → 电网馈网）
+        # ---- 光伏分配（优先级：负载 → 电网馈网 → 电池充电）
         pv_to_load = min(a0, l)                      # 1) 供本地负载
         surplus = max(a0 - l, 0.0)                   #    负载外富余
         deficit = max(l - a0, 0.0)                   #    负载缺口（光伏不足）
@@ -214,21 +214,23 @@ class HybridInverter:
             out = pv_use + d
             inv_set = float(np.clip(out, -inv_max, inv_max))
         else:
-            # 图1/图2 —— 光伏供给优先级：负载 → 电池充电 → 电网馈网
-            c_pv = min(surplus, chg_cap)               # 富余充电池（可突破 TOU 计划，≤1 倍额定）
-            pv_left = surplus - c_pv
+            # 图1/图2 —— 光伏供给优先级：负载 → 电网馈网(≤F) → 电池充电
             export_cap = inv_max if F is None else min(inv_max, max(F, 0.0))
-            # 储能充满(无充电余量)后才允许馈网；充满前富余不馈网（≤F、≤逆变能力）
-            pv_export = 0.0 if chg_cap > 0.0 else min(pv_left, export_cap)
+            pv_export = min(surplus, export_cap)        # 富余先馈网（≤F、≤逆变能力）
+            pv_excess2bat = surplus - pv_export         # 超出馈网上限/防逆流的富余 → 电池
+            c_pv = min(pv_excess2bat, chg_cap)          # 富余充电池（可突破 TOU 计划，≤1 倍额定）
 
-            # 电池放电（仅光伏无富余时按 TOU 计划执行；不突破计划，计划内可馈网 ≤F）
+            # 电池放电（TOU 计划，不突破计划；馈网未到上限时可补足出口 ≤F）
             d = 0.0
-            if plan > 0.0 and surplus <= 0.0 and dis_cap > 0.0:
+            if plan > 0.0 and dis_cap > 0.0:
                 if F is None:
                     room = plan_mag                    # 无馈网上限：按计划全额放电
                 else:
-                    room = deficit + max(F, 0.0)       # 补负载缺口 + 计划内馈网空间(≤F)
-                d = min(plan_mag, room, dis_cap)
+                    room = deficit + max(F - pv_export, 0.0)   # 补负载缺口 + 馈网剩余空间
+                d = min(plan_mag, room)
+                if pv_excess2bat > 0.0:                # 富余超馈网上限将充电 → 放电只补负载缺口
+                    d = min(d, deficit)
+                d = min(d, dis_cap)
 
             # TOU 充电计划：光伏已充后不足部分由电网补足；总取电(负载+充电) ≤ I
             c_grid = 0.0
