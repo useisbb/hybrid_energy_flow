@@ -217,31 +217,27 @@ def plot_all_cases(results, kind, fname=None):
             # 图二（提示词“第二张图绘制内容，EMS怎么控制电池” L91-99）：
             #   数据：光伏功率/电网功率/电池功率/TOU计划功率/逆变设置功率/逆变实际功率/负载 + 充满放空标识；
             #   每条曲线按 1kW 递增错开（第止k 条 重1叠（图例标注偏移量）。
-            #   逆变设置功率=限制功率（闭环，随取电/馈电限制，不取决于计划）：
-            #     充电：受取电限制 → −(取电上限 I − 负载)；PV>计划时反转为放电方向（触发不变）；
-            #     待机：闭环使电池口=0 → 逆变设置随 PV 上升 min(PV, 逆变额定)；
-            #     放电/馈网：受馈电限制 → min(馈电上限 F + 负载, 逆变额定)；
-            #     约束：取电≤I、≤逆变额定；SOC 充满后电池目标=0（不充电不放电），放空不放电。
+            #   逆变设置功率=限制功率（闭环跟随电网口功率以满足计划）：
+            #     目标：电网口功率 g 使电池口=计划 → g = 负载 − 光伏实际 − 计划；
+            #     由交流平衡 逆变设置 = 负载 − g = 光伏实际 + 计划；
+            #     上下限受馈网/取电限制：馈网≤F → 逆变设置 ≤ 负载+F；取电≤I → 逆变设置 ≥ 负载−I；并≤逆变额定。
+            #     SOC 充满后电池目标=0（不充不放），放空不放电。
             m = r["model"]
             inv_rated = m.inverter_rated_kw
             i_lim = m.grid_import_limit_kw if m.grid_import_limit_kw is not None else inv_rated
             f_lim = 0.0 if m.export_limit_kw is None else max(m.export_limit_kw, 0.0)
             cmd = np.asarray(r["cmd"], float)
             load = np.asarray(r["load"], float)
-            pv_av = np.asarray(r["pv"], float)                       # 光伏可用功率
+            pv_used = np.asarray(s["pv"]["光伏功率(kW)"], float)     # 光伏实际利用
             soc = np.asarray(s["battery"]["储能SOC(%)"], float)
             full = soc >= (m.soc_max - 1e-9)                         # 充满：电池目标=0
             empty = soc <= (m.soc_min + 1e-9)                        # 放空：不放电
-            pchg = np.abs(cmd)
-            idle_loop = np.minimum(pv_av, inv_rated)                 # 待机闭环：电池口=0，随PV上升
-            chg_loop = -np.maximum(i_lim - load, 0.0)                # 充电：受取电限制（不取决于计划）
-            feed_loop = np.minimum(f_lim + load, inv_rated)          # 馈网/放电：受馈电限制
-            inv_set = np.where(cmd < 0.0, np.where(pv_av > pchg, feed_loop, chg_loop),
-                               np.where(cmd > 0.0, feed_loop, idle_loop))
-            inv_set = np.where(full, idle_loop, inv_set)             # 目标约束：充满后不充不放
-            inv_set = np.where(empty & (cmd > 0.0), idle_loop, inv_set)
-            inv_set = np.clip(inv_set, -inv_rated, inv_rated)
-            inv_set = np.maximum(inv_set, -min(i_lim, inv_rated))    # 逆变口取电限制
+            plan_eff = np.where(full, 0.0, cmd)
+            plan_eff = np.where(empty & (plan_eff > 0.0), 0.0, plan_eff)
+            inv_raw = pv_used + plan_eff                             # 闭环：逆变设置 = 光伏实际 + 计划
+            lower = np.maximum(load - i_lim, -inv_rated)             # 取电限制(下限) + 逆变额定
+            upper = np.minimum(load + f_lim, inv_rated)              # 馈网限制(上限) + 逆变额定
+            inv_set = np.clip(inv_raw, lower, upper)
             raw = [("光伏功率", np.asarray(s["pv"]["光伏功率(kW)"], float)),
                    ("电网功率", np.asarray(s["grid"]["电网功率(kW)"], float)),
                    ("电池功率", np.asarray(s["battery"]["电池功率(kW)"], float)),
@@ -343,9 +339,8 @@ def render_report(results, fp_fig1, fp_fig2):
     A("")
     A("> 说明：按提示词.md“第二张图绘制内容，EMS怎么控制电池”L91-99 的**闭环限制**重算，工况数值与图一相同；"
       "为防止重叠，TOU计划功率不偏移(+0)、其余曲线整体 +k kW 显示（图例已标注偏移量，充满▲/放空▼标于 y=0 未偏移）。"
-      "逆变设置功率(限制功率)随**取电/馈电限制**（不取决于计划）：充电 `−(取电上限 I−负载)`，PV>计划时反转为放电方向；"
-      "待机=闭环使电池口=0 `min(PV, 逆变额定)`（随 PV 增加而增加）；放电/馈网 `min(馈电上限 F+负载, 逆变额定)`；"
-      "约束：取电≤I、≤逆变额定；SOC 充满后电池目标=0（不充电不放电），放空不放电。")
+      "逆变设置功率(限制功率)=**闭环跟随电网口功率以满足计划**：由交流平衡 逆变设置 = 光伏实际 + 计划（即电网口 g=负载−光伏−计划）；"
+      "上下限受馈网/取电限制：馈网≤F → ≤负载+F，取电≤I → ≥负载−I，并≤逆变额定；SOC 充满后电池目标=0（不充不放）、放空不放电。")
     A("> 校验：逐分钟满足 `光伏实际+电池实际=逆变实际`（max err≤0.001kW，电池负充正放）；曲线原始值未缩放，仅按上述规则平移显示。")
     A("")
     A("## 各工况说明")
