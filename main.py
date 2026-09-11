@@ -9,11 +9,10 @@ main.py — 光储一体机(混逆) TOU 控制仿真：按「提示词.md」重�
     SOC 到限功率清零、TOU 放电不突破计划；
     放电按提示词第二张图“直接设置电池放电=计划、计划内可馈网(≤F)”执行
   - 输出（全部输出到 ems_result/）：
-    1) 图一：全部工况 —— 负载/电网/电池/光伏辐照/TOU计划 功率
-    2) 图二：工况1~2 —— TOU计划/逆变设置/逆变实际/电池设置/电池实际 功率（提示词赋值公式）
-    3) 图三：默认单曲线 TOU(5-8/12-14充·9-11/18-20放) 恒总功率放电
-    4) 每工况四端口数据 CSV
-    5) EMS测试报告.md
+    1) 图一：全部工况（工况1~4） —— 负载/电网/电池/光伏辐照/TOU计划 功率
+    2) 图二：工况1~4 —— 光伏/电网/电池/TOU计划/逆变设置/逆变实际 功率（每条错开 1kW 防重叠）
+    3) 每工况四端口数据 CSV
+    4) EMS测试报告.md
 """
 
 from __future__ import annotations
@@ -60,9 +59,9 @@ LINE = "-" * 76
 
 STYLE1 = {"负载": ("0.3", "-"), "电网": ("g", "-"), "电池": ("b", "-"),
           "光伏辐照": ("orange", "-"), "TOU计划": ("k", "--"), "逆变": ("r", "-")}
-STYLE2 = {"TOU计划": ("k", "--"), "负载": ("0.45", "-"), "光伏": ("orange", "-"),
-          "逆变设置": ("m", ":"), "逆变实际": ("r", "-"),
-          "电池设置": ("c", "--"), "电池实际": ("b", "-")}
+STYLE2 = {"光伏功率": ("orange", "-"), "电网功率": ("g", "-"), "电池功率": ("b", "-"),
+          "TOU计划功率": ("k", "--"), "逆变设置功率": ("m", ":"), "逆变实际功率": ("r", "-"),
+          "负载": ("0.45", "-")}
 
 
 def hours_of(times):
@@ -149,6 +148,15 @@ def build_cases():
                       check=("取电不超过150kW且无馈网", lambda s: float(s["grid"]["电网功率(kW)"].max()) <= 150.0 + EPS
                              and float(s["grid"]["电网功率(kW)"].min()) >= -EPS)))
 
+    # ---- 工况4：TOU放电恒总功率（默认曲线，原图3 工况并入）
+    #      TOU：充电 05-08、12-14（-100kW）/ 放电 09-11、18-20（+100kW）；光伏峰值 70kW；
+    #      馈网上限 20kW；SOC 初值 0%；keep_total_discharge=True（放电时段光伏置换电池、总功率不变） ----
+    ld4 = 45.0 + gauss(h1, 9.5, 1.2, 55.0) + gauss(h1, 19.5, 1.6, 60.0)
+    cases.append(dict(title="工况4 TOU放电恒总功率·默认曲线", times=t1, pv=pv_sine(h1, 70.0), load=ld4,
+                      cmd=np.array([_tou3(x) for x in t1], dtype=float),
+                      kw=dict(export_limit_kw=20.0, keep_total_discharge=True, soc_init=0.0),
+                      check=("馈网(卖电)不超过20kW", lambda s: float(s["grid"]["电网功率(kW)"].min()) >= -20.0 - EPS)))
+
     return cases
 
 
@@ -173,9 +181,9 @@ def run_cases(cases):
     return results
 
 
-# ================================================================ 图3 专用（TOU放电恒总功率 · 默认单曲线 · 新TOU时段）
+# ================================================================ 工况4 默认 TOU 时段
 def _tou3(dt, chg_kw=100.0, dis_kw=100.0):
-    """图3 默认 TOU：充电 05-08、12-14（-100）；放电 09-11、18-20（+100）；其余待机。"""
+    """工况4 默认 TOU：充电 05-08、12-14（-100）；放电 09-11、18-20（+100）；其余待机。"""
     h = dt.hour + dt.minute / 60.0
     if (5.0 <= h < 8.0) or (12.0 <= h < 14.0):
         return -chg_kw
@@ -184,34 +192,16 @@ def _tou3(dt, chg_kw=100.0, dis_kw=100.0):
     return 0.0
 
 
-def fig3_default_case():
-    """图3 默认单曲线（不再复用工况1~3）：负载=基准日曲线；光伏峰值 70kW；
-    TOU：充电 05-08、12-14 / 放电 09-11、18-20（±100kW）；
-    模式：keep_total_discharge（TOU放电恒总功率），馈网上限 20kW，SOC 初值 0%。"""
-    t = pd.date_range(f"{DATE} 00:00", f"{DATE} 23:59", freq="1min")
-    h = hours_of(t)
-    ld = 45.0 + gauss(h, 9.5, 1.2, 55.0) + gauss(h, 19.5, 1.6, 60.0)   # 基准日负载曲线
-    cmd = np.array([_tou3(x) for x in t], dtype=float)
-    return dict(title="图3 默认·TOU(5-8/12-14充·9-11/18-20放)",
-                times=t, pv=pv_sine(h, 70.0), load=ld, cmd=cmd,
-                kw=dict(export_limit_kw=20.0, keep_total_discharge=True, soc_init=0.0),
-                check=("馈网(卖电)不超过20kW", lambda s: float(s["grid"]["电网功率(kW)"].min()) >= -20.0 - EPS))
-
-
-def run_keep_total_cases(cases=None):
-    """图3：默认单曲线 + keep_total_discharge=True（忽略传入的工况列表）。"""
-    return run_cases([fig3_default_case()])
-
-
 # ================================================================ 图一 / 图二
 def plot_all_cases(results, kind, fname=None):
     """图一(kind=1)：全部工况——负载/电网/电池(×0.95防重叠)/光伏辐照/TOU计划（不含逆变功率）；
-       图二(kind=2)：工况1~2——TOU计划/负载/光伏/逆变设置/逆变实际/电池设置/电池实际（提示词 L69-81 赋值公式）。
-       fname：可覆盖输出文件名（图3 用 keep_total_discharge 模式同一曲线模板）。"""
-    if kind == 2:
-        results = [r for r in results if r["title"].startswith(("工况1", "工况2"))]
+       图二(kind=2)：全部工况（与图一同一工况数值）——按提示词“第二张图绘制内容，EMS怎么控制电池”：
+                     光伏功率/电网功率/电池功率/TOU计划功率/逆变设置功率/逆变实际功率 + 充满放空标识，
+                     每条曲线按 1kW 递增错开防重叠。
+       fname：可覆盖输出文件名。"""
     nrow = len(results)
-    fig, ax = plt.subplots(nrow, 1, figsize=(14, 3.1 * nrow), sharex=False)
+    # 每行高度 3.1in → 4.65in（+50%）
+    fig, ax = plt.subplots(nrow, 1, figsize=(14, 4.65 * nrow), sharex=False)
     if nrow == 1:
         ax = [ax]
     for i, r in enumerate(results):
@@ -224,24 +214,47 @@ def plot_all_cases(results, kind, fname=None):
                       ("光伏辐照", pv_disp, None), ("TOU计划", r["cmd"], None)]
             title = f"{r['title']}：负载/电网/电池/光伏辐照/TOU计划"
         else:
-            # 图二（提示词 L69-81 赋值公式）：TOU计划/负载/光伏/逆变设置/逆变实际/电池设置/电池实际 + 充满放空标识
-            #  充电：电池设置=∞(允许光伏突破计划充电)；待机：电池设置=∞(仅光伏充电)；
-            #  放电：电池设置=TOU计划功率(直接放电)。充电/待机无直接电池命令 → 电池设置曲线为 NaN 断线。
-            #  物理口径恒等：逆变实际 = 光伏实际 + 电池实际(放电为正)，即 电池 = 逆变 − 光伏；
-            #  逆变设置 = EMS 目标(逆变设置功率列)；实际曲线按×0.95 错开避免与设置重叠。
+            # 图二（提示词“第二张图绘制内容，EMS怎么控制电池” L91-99）：
+            #   数据：光伏功率/电网功率/电池功率/TOU计划功率/逆变设置功率/逆变实际功率/负载 + 充满放空标识；
+            #   每条曲线按 1kW 递增错开（第止k 条 重1叠（图例标注偏移量）。
+            #   逆变设置功率=限制功率（闭环，随取电/馈电限制，不取决于计划）：
+            #     充电：受取电限制 → −(取电上限 I − 负载)；PV>计划时反转为放电方向（触发不变）；
+            #     待机：闭环使电池口=0 → 逆变设置随 PV 上升 min(PV, 逆变额定)；
+            #     放电/馈网：受馈电限制 → min(馈电上限 F + 负载, 逆变额定)；
+            #     约束：取电≤I、≤逆变额定；SOC 充满后电池目标=0（不充电不放电），放空不放电。
+            m = r["model"]
+            inv_rated = m.inverter_rated_kw
+            i_lim = m.grid_import_limit_kw if m.grid_import_limit_kw is not None else inv_rated
+            f_lim = 0.0 if m.export_limit_kw is None else max(m.export_limit_kw, 0.0)
             cmd = np.asarray(r["cmd"], float)
-            pv_act = np.asarray(s["pv"]["光伏功率(kW)"], float)
-            bat_act = np.asarray(s["battery"]["电池功率(kW)"], float)
-            inv_set_disp = np.asarray(s["inverter"]["逆变设置功率(kW)"], float)   # 物理EMS设置
-            inv_act_disp = (pv_act + bat_act) * 0.95                              # 逆变实际=光伏+电池(×0.95)
-            series = [("TOU计划", r["cmd"], None),
-                      ("负载", r["load"], None),
-                      ("光伏", pv_act, None),
-                      ("逆变设置", inv_set_disp, None),
-                      ("逆变实际", inv_act_disp, "逆变实际=光伏+电池(×0.95)"),
-                      ("电池设置", s["battery"]["电池设置功率(kW)"], "电池设置(放电=TOU计划;充/待机=∞)"),
-                      ("电池实际", bat_act * 0.95, "电池实际(×0.95)")]
-            title = f"{r['title']}：TOU计划/负载/光伏/逆变设置/逆变实际/电池设置/电池实际"
+            load = np.asarray(r["load"], float)
+            pv_av = np.asarray(r["pv"], float)                       # 光伏可用功率
+            soc = np.asarray(s["battery"]["储能SOC(%)"], float)
+            full = soc >= (m.soc_max - 1e-9)                         # 充满：电池目标=0
+            empty = soc <= (m.soc_min + 1e-9)                        # 放空：不放电
+            pchg = np.abs(cmd)
+            idle_loop = np.minimum(pv_av, inv_rated)                 # 待机闭环：电池口=0，随PV上升
+            chg_loop = -np.maximum(i_lim - load, 0.0)                # 充电：受取电限制（不取决于计划）
+            feed_loop = np.minimum(f_lim + load, inv_rated)          # 馈网/放电：受馈电限制
+            inv_set = np.where(cmd < 0.0, np.where(pv_av > pchg, feed_loop, chg_loop),
+                               np.where(cmd > 0.0, feed_loop, idle_loop))
+            inv_set = np.where(full, idle_loop, inv_set)             # 目标约束：充满后不充不放
+            inv_set = np.where(empty & (cmd > 0.0), idle_loop, inv_set)
+            inv_set = np.clip(inv_set, -inv_rated, inv_rated)
+            inv_set = np.maximum(inv_set, -min(i_lim, inv_rated))    # 逆变口取电限制
+            raw = [("光伏功率", np.asarray(s["pv"]["光伏功率(kW)"], float)),
+                   ("电网功率", np.asarray(s["grid"]["电网功率(kW)"], float)),
+                   ("电池功率", np.asarray(s["battery"]["电池功率(kW)"], float)),
+                   ("TOU计划功率", cmd),
+                   ("逆变设置功率", inv_set),
+                   ("逆变实际功率", np.asarray(s["inverter"]["逆变功率(kW)"], float)),
+                   ("负载", load)]
+            series = []
+            for k, (nm, yv) in enumerate(raw):
+                off = 0.0 if nm == "TOU计划功率" else 1.0 * k   # 计划功率不偏移(0)，其余按 1kW 递增错开
+                series.append((nm, np.asarray(yv, float) + off,
+                               nm if off == 0.0 else f"{nm}(+{off:g}kW)"))
+            title = f"{r['title']}：光伏/电网/电池/TOU计划/逆变设置/逆变实际（计划功率不偏移，其余 +1kW 错开）"
         styles = STYLE1 if kind == 1 else STYLE2
         for name, y, lab in series:
             clr, ls = styles[name]
@@ -256,7 +269,7 @@ def plot_all_cases(results, kind, fname=None):
                            label=lab if j == 0 else None)
         ax[i].set_ylabel("功率(kW)")
         ax[i].set_title(title)
-        ax[i].legend(fontsize=8, ncol=min(len(series) + 2, 6), loc="upper left")
+        ax[i].legend(fontsize=8, ncol=3 if kind == 2 else min(len(series) + 2, 6), loc="upper left")
         ax[i].grid(alpha=0.3)
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -291,13 +304,14 @@ def export_data(results):
 
 
 # ================================================================ 报告
-def render_report(results, fp_fig1, fp_fig2, fp_fig3=None):
+def render_report(results, fp_fig1, fp_fig2):
     L = []
     A = L.append
     A("# 光储一体机(混逆) EMS/TOU 控制仿真报告")
     A("")
     A(f"- 生成时间：{NOW}")
-    A(f"- 模型：`mode_hybrid.HybridInverter`；额定 125kW；PV 2 倍超配 250kW；电池 125kW/220kWh；SOC [{SOC_MIN:g}%,{SOC_MAX:g}%]")
+    A(f"- 模型：`mode_hybrid.HybridInverter`；额定 {RATED_KW:g}kW；PV {PV_RATED_KW / RATED_KW:g} 倍超配 {PV_RATED_KW:g}kW；"
+      f"电池 {BAT_KW:g}kW/{BAT_KWH:g}kWh；SOC [{SOC_MIN:g}%,{SOC_MAX:g}%]")
     A("- TOU 控制：充电(08-11、17-19) 10kW / 放电(12-14、19-22) 50kW / 其余待机；**负充正放**")
     A("- EMS 策略（提示词.md）：光伏供给优先级 **负载 > 电网馈网 > 电池充电**（富余先馈网≤F，超出馈网上限/防逆流的富余才充电池），"
       "馈网电能优先级 光伏>电池、电池充电电源优先级 光伏>电网；馈网上限 F（正=卖电上限，0=防逆流），约束内尽量多卖电且**不突破计划放电**；"
@@ -317,36 +331,23 @@ def render_report(results, fp_fig1, fp_fig2, fp_fig3=None):
           f"{x['馈网(kWh)']:.1f} | {x['弃光(kWh)']:.1f} | {x['SOC范围(%)']} | "
           f"{'[OK]' if r['ok'] else '[FAIL]'} |")
     A("")
-    A("## 图一：执行策略——工况1~3（负载/电网/电池(×0.95)/光伏辐照/TOU计划；已去除逆变功率以避免曲线重叠）")
+    A("## 图一：执行策略——工况1~4（负载/电网/电池(×0.95)/光伏辐照/TOU计划；已去除逆变功率以避免曲线重叠）")
     A("")
     A(f"![图一]({os.path.basename(fp_fig1)})")
     A("")
     A("> 说明：图一电池功率曲线按计算值×0.95 绘制以分离重叠。")
     A("")
-    A("## 图二：TOU 赋值计算公式示意——工况1~2（TOU计划/负载/光伏/逆变设置/逆变实际/电池设置/电池实际，含充满▲/放空▼标识）")
+    A("## 图二：EMS 怎么控制电池——工况1~4（光伏/电网/电池/TOU计划/逆变设置/逆变实际/负载 功率；TOU计划功率不偏移、其余按 1kW 递增错开；含充满▲/放空▼标识）")
     A("")
     A(f"![图二]({os.path.basename(fp_fig2)})")
     A("")
-    A("> 说明：按提示词.md 第二张图重写。充电/待机：电池设置=∞（曲线 NaN 断线），DSP 允许光伏突破计划充电，"
-      "充电电网部分受取电上限约束 `逆变设置=MIN(TOU计划, 电池最大取电-负载)`、待机取电网 0；"
-      "放电：电池设置=TOU计划功率（≤1 倍额定）、计划内可馈网(≤F)、不突破计划；"
-      "光伏富余时按“光伏消纳>TOU计划”削减放电甚至反转为充电（图中放电窗内电池实际可为负）。"
-      "物理口径恒等：逆变实际=光伏实际+电池实际(放电为正)、逆变设置=EMS 目标(逆变设置列)；"
-      "实际曲线按×0.95 错开显示。")
-    A("> 校验：工况1 光伏峰值 80kW、工况2 峰值 40kW；逐分钟满足 `光伏实际+电池实际=逆变实际`（max err≤0.001kW），"
-      "即“放电为正”口径下 `电池功率 = 逆变口功率 − 光伏功率`。")
+    A("> 说明：按提示词.md“第二张图绘制内容，EMS怎么控制电池”L91-99 的**闭环限制**重算，工况数值与图一相同；"
+      "为防止重叠，TOU计划功率不偏移(+0)、其余曲线整体 +k kW 显示（图例已标注偏移量，充满▲/放空▼标于 y=0 未偏移）。"
+      "逆变设置功率(限制功率)随**取电/馈电限制**（不取决于计划）：充电 `−(取电上限 I−负载)`，PV>计划时反转为放电方向；"
+      "待机=闭环使电池口=0 `min(PV, 逆变额定)`（随 PV 增加而增加）；放电/馈网 `min(馈电上限 F+负载, 逆变额定)`；"
+      "约束：取电≤I、≤逆变额定；SOC 充满后电池目标=0（不充电不放电），放空不放电。")
+    A("> 校验：逐分钟满足 `光伏实际+电池实际=逆变实际`（max err≤0.001kW，电池负充正放）；曲线原始值未缩放，仅按上述规则平移显示。")
     A("")
-    if fp_fig3:
-        A("## 图三：TOU放电恒总功率（默认单曲线；负载/电网/电池(×0.95)/光伏辐照/TOU计划）")
-        A("")
-        A(f"![图三]({os.path.basename(fp_fig3)})")
-        A("")
-        A("> 说明：图3 使用独立默认曲线（负载=基准日曲线、光伏峰值 70kW），TOU 计划时段："
-          "充电 05-08、12-14（-100kW），放电 09-11、18-20（+100kW），其余待机。"
-          "TOU 放电行为=恒总功率——目标 AC 出力 = 负载 + 馈网目标(≤20kW、≤逆变额定) 维持不变；"
-          "放电时段光伏有发电时优先出力（供负载→馈网），电池放电功率相应减小（≤TOU 计划、≤1 倍额定），"
-          "总功率保持不变；电池不因光伏富余反转充电，超出目标的光伏弃光。充电/待机时段仍按光伏优先：负载→馈网(≤F)→充电池执行。")
-        A("")
     A("## 各工况说明")
     A("")
     for i, r in enumerate(results, 1):
@@ -360,8 +361,10 @@ def render_report(results, fp_fig1, fp_fig2, fp_fig3=None):
         A("")
     A("## 说明与假设")
     A("")
-    A("- “逆变设置功率”=EMS 模式目标 AC 出力（充电=取电上限约束下的充电功率(负)；待机=TOU计划(0)；放电=负载+计划内馈网(≤F)的期望出力，均受逆变限幅）。")
-    A("- “电池设置功率”=放电时段 TOU计划功率；充电/待机=∞（不直接限制电池，仅由取电上限/光伏富余间接控制，图中为断线）。")
+    A("- 图二数据：光伏功率/电网功率/电池功率/TOU计划功率/逆变设置功率/逆变实际功率/负载 + 充满▲/放空▼；"
+      "为防重叠，TOU计划功率不偏移(+0)，其余曲线整体 +k kW 显示（图例标注偏移量；标记未偏移，标于 y=0）。")
+    A("- “逆变设置功率”=限制功率（闭环，随取电/馈电限制、不取决于计划）：充电 `−(取电上限 I−负载)`（PV>计划时反转为放电方向）；"
+      "待机 `min(PV, 逆变额定)`；放电/馈网 `min(馈电上限 F+负载, 逆变额定)`；受取电 I、逆变额定约束；SOC 充满后电池目标=0。")
     A("- “逆变实际功率”=光伏实际 + 电池实际（电池负充正放），受 SOC/功率限值修正。")
     A("- 光伏供给顺序 = 负载→电网馈网→电池充电：富余先馈网（≤F、≤逆变额定），"
       "超出馈网上限/防逆流时的富余才充电池（可突破 TOU 计划、≤1 倍额定功率）；储能充满后多余弃光；"
@@ -373,6 +376,10 @@ def render_report(results, fp_fig1, fp_fig2, fp_fig3=None):
       "19:00 起 5 小时内负载逐渐下降 30 kW。")
     A("- 工况3 说明：负载峰值约 96kW ≤ 取电上限 150kW，全天无缺供且无馈网（防逆流）；"
       "光伏富余只能充电池，充满(SOC90%)后多余弃光；充电(08-11、17-19)与放电(12-14、19-22)按 TOU 执行。")
+    A("- 工况4（原图3 合并）：默认曲线（负载=基准日曲线、光伏峰值 70kW，SOC 初值 0%）；"
+      "TOU 时段：充电 05-08、12-14（-100kW）、放电 09-11、18-20（+100kW）；馈网上限 20kW；"
+      "TOU 放电恒总功率——目标 AC 出力=负载+馈网目标(≤20kW、≤逆变额定)维持不变，光伏优先出力、电池放电相应减小，"
+      "电池不因光伏富余反转充电，超出目标部分弃光。")
     A("- 图中事件标识：▲=电池充满(SOC 到达上限)、▼=电池放空(SOC 到达下限)，标于 y=0。")
     A("")
     fp = os.path.join(OUT, "EMS测试报告.md")
@@ -391,16 +398,10 @@ def main():
         print(f"[工况{i}] {r['title']}  校验: {'通过' if r['ok'] else '未通过'}")
     fp1 = plot_all_cases(results, kind=1)
     fp2 = plot_all_cases(results, kind=2)
-    # 图3：TOU放电恒总功率（默认单曲线，独立TOU时段：5-8/12-14充·9-11/18-20放）
-    results3 = run_keep_total_cases()
-    for i, r in enumerate(results3, 1):
-        print(f"[图3] {r['title']}  恒总功率放电  校验: {'通过' if r['ok'] else '未通过'}")
-    fp3 = plot_all_cases(results3, kind=1,
-                         fname="EMS_图三_TOU放电恒总功率_默认曲线.png")
     export_data(results)
-    report = render_report(results, fp1, fp2, fp3)
+    report = render_report(results, fp1, fp2)
     print(LINE)
-    print(f"图片: {fp1}\n      {fp2}\n      {fp3}")
+    print(f"图片: {fp1}\n      {fp2}")
     print(f"数据: {DATA}\\*.csv")
     print(f"报告: {report}")
 
