@@ -10,9 +10,10 @@ main.py — 光储一体机(混逆) TOU 控制仿真：按「提示词.md」重�
     放电按提示词第二张图“直接设置电池放电=计划、计划内可馈网(≤F)”执行
   - 输出（全部输出到 ems_result/）：
     1) 图一：全部工况（工况1~4） —— 负载/电网/电池/光伏辐照/TOU计划 功率
-    2) 图二：工况1~4 —— 光伏/电网/电池/TOU计划/逆变设置/逆变实际 功率（每条错开 1kW 防重叠）
-    3) 每工况四端口数据 CSV
-    4) EMS测试报告.md
+    2) 图二：工况1~4 —— 光伏/电网/电池/TOU计划/逆变设置/逆变实际/负载/限制放电 功率（每条错开 1kW 防重叠）
+    3) 图三：全部工况 —— 自发自用（防逆流）功率曲线
+    4) 每工况四端口数据 CSV
+    5) EMS测试报告.md
 """
 
 from __future__ import annotations
@@ -192,12 +193,25 @@ def _tou3(dt, chg_kw=100.0, dis_kw=100.0):
     return 0.0
 
 
+# ================================================================ 图3 自发自用（全部工况）
+def run_self_use_cases(cases):
+    """图3：全部工况套用自发自用模式（无 TOU、防逆流；光伏自用→富余充电池→缺口电池补）。"""
+    out = []
+    for c in cases:
+        kw = dict(c["kw"])
+        kw.update(export_limit_kw=0.0, self_consumption=True)
+        out.append(dict(c, kw=kw, cmd=np.zeros(len(c["times"])),
+                        title=f"自发自用·{c['title']}"))
+    return run_cases(out)
+
+
 # ================================================================ 图一 / 图二
 def plot_all_cases(results, kind, fname=None):
     """图一(kind=1)：全部工况——负载/电网/电池(×0.95防重叠)/光伏辐照/TOU计划（不含逆变功率）；
        图二(kind=2)：全部工况（与图一同一工况数值）——按提示词“第二张图绘制内容，EMS怎么控制电池”：
-                     光伏功率/电网功率/电池功率/TOU计划功率/逆变设置功率/逆变实际功率 + 充满放空标识，
+                     光伏功率/电网功率/电池功率/TOU计划功率/逆变设置功率/逆变实际功率/负载/限制放电 + 充满放空标识，
                      每条曲线按 1kW 递增错开防重叠。
+       图三(kind=3)：全部工况的自发自用（防逆流）——负载/电网/电池/光伏。
        fname：可覆盖输出文件名。"""
     nrow = len(results)
     # 每行高度 3.1in → 4.65in（+50%）
@@ -206,13 +220,17 @@ def plot_all_cases(results, kind, fname=None):
         ax = [ax]
     for i, r in enumerate(results):
         t, s = r["times"], r["samples"]
-        if kind == 1:
-            pv_disp = r.get("pv_disp", r["pv"])   # 图1显示用光伏曲线（默认=工况可用光伏）
+        if kind in (1, 3):
+            pv_disp = r.get("pv_disp", r["pv"])   # 图1/图3显示用光伏曲线（默认=工况可用光伏）
             series = [("负载", r["load"], None), ("电网", s["grid"]["电网功率(kW)"], None),
                       ("电池", np.asarray(s["battery"]["电池功率(kW)"], float) * 0.95,
                        "电池功率(×0.95)"),
-                      ("光伏辐照", pv_disp, None), ("TOU计划", r["cmd"], None)]
-            title = f"{r['title']}：负载/电网/电池/光伏辐照/TOU计划"
+                      ("光伏辐照", pv_disp, None)]
+            if kind == 1:
+                series.append(("TOU计划", r["cmd"], None))
+                title = f"{r['title']}：负载/电网/电池/光伏辐照/TOU计划"
+            else:
+                title = f"{r['title']}：自发自用（负载/电网/电池/光伏）"
         else:
             # 图二（提示词“第二张图绘制内容，EMS怎么控制电池” L91-99）：
             #   数据：光伏/电网/电池/TOU计划/逆变设置/逆变实际/负载/限制放电 功率 + 充满放空标识；
@@ -253,7 +271,7 @@ def plot_all_cases(results, kind, fname=None):
                 series.append((nm, np.asarray(yv, float) + off,
                                nm if off == 0.0 else f"{nm}(+{off:g}kW)"))
             title = f"{r['title']}：光伏/电网/电池/TOU计划/逆变设置/逆变实际/负载/限制放电（计划功率不偏移，其余 +1kW 错开）"
-        styles = STYLE1 if kind == 1 else STYLE2
+        styles = STYLE1 if kind in (1, 3) else STYLE2
         for name, y, lab in series:
             clr, ls = styles[name]
             ax[i].plot(t, y, color=clr, ls=ls, lw=1.1, label=lab or name)
@@ -271,8 +289,10 @@ def plot_all_cases(results, kind, fname=None):
         ax[i].grid(alpha=0.3)
     fig.autofmt_xdate()
     fig.tight_layout()
-    name = fname if fname else ("EMS_图一_全部工况_功率曲线.png" if kind == 1
-                                else "EMS_图二_设置与执行_曲线.png")
+    name = fname if fname else (
+        "EMS_图一_全部工况_功率曲线.png" if kind == 1 else
+        "EMS_图三_自发自用_全部工况.png" if kind == 3 else
+        "EMS_图二_设置与执行_曲线.png")
     fp = os.path.join(OUT, name)
     fig.savefig(fp, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -302,7 +322,7 @@ def export_data(results):
 
 
 # ================================================================ 报告
-def render_report(results, fp_fig1, fp_fig2):
+def render_report(results, fp_fig1, fp_fig2, fp_fig3=None):
     L = []
     A = L.append
     A("# 光储一体机(混逆) EMS/TOU 控制仿真报告")
@@ -346,6 +366,15 @@ def render_report(results, fp_fig1, fp_fig2):
       "**限制放电功率**：TOU 放电时段 = TOU 功率，其他时段 = 0。")
     A("> 校验：逐分钟满足 `光伏实际+电池实际=逆变实际`（max err≤0.001kW，电池负充正放）；曲线原始值未缩放，仅按上述规则平移显示。")
     A("")
+    if fp_fig3:
+        A("## 图三：自发自用——全部工况（负载/电网/电池(×0.95)/光伏；防逆流不馈网）")
+        A("")
+        A(f"![图三]({os.path.basename(fp_fig3)})")
+        A("")
+        A("> 说明：图3 为**自发自用**模式（忽略 TOU 计划、防逆流 F=0）：光伏优先供本地负载，"
+          "富余全部给电池充电（充满后弃光）；光伏不足时由电池补负载缺口（放空后取电网）；无馈网。"
+          "工况数值与图一相同（复用各工况负载/光伏曲线）。")
+        A("")
     A("## 各工况说明")
     A("")
     for i, r in enumerate(results, 1):
@@ -397,10 +426,15 @@ def main():
         print(f"[工况{i}] {r['title']}  校验: {'通过' if r['ok'] else '未通过'}")
     fp1 = plot_all_cases(results, kind=1)
     fp2 = plot_all_cases(results, kind=2)
+    # 图3：自发自用（全部工况，防逆流不馈网）
+    results3 = run_self_use_cases(cases)
+    for i, r in enumerate(results3, 1):
+        print(f"[自发自用·工况{i}] 校验: {'通过' if r['ok'] else '未通过'}")
+    fp3 = plot_all_cases(results3, kind=3)
     export_data(results)
-    report = render_report(results, fp1, fp2)
+    report = render_report(results, fp1, fp2, fp3)
     print(LINE)
-    print(f"图片: {fp1}\n      {fp2}")
+    print(f"图片: {fp1}\n      {fp2}\n      {fp3}")
     print(f"数据: {DATA}\\*.csv")
     print(f"报告: {report}")
 

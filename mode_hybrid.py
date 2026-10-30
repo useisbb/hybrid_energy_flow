@@ -61,6 +61,7 @@ class HybridInverter:
         export_limit_kw: float | None = None,  # 馈网功率限制（None=不限，受逆变额定约束）
         grid_import_limit_kw: float | None = None,  # 购电功率限制（None=不限）
         keep_total_discharge: bool = False,   # 图3：TOU放电时段维持总功率不变（光伏置换电池放电）
+        self_consumption: bool = False,       # 图3：自发自用模式（防逆流，光伏优先自用，电池补缺口）
     ):
         # ---- 额定/端口容量
         self.inverter_rated_kw = float(rated_power_kw)
@@ -78,6 +79,7 @@ class HybridInverter:
         self.grid_import_limit_kw = grid_import_limit_kw
         self.grid_charge_allowed = grid_charge_allowed
         self.keep_total_discharge = bool(keep_total_discharge)
+        self.self_consumption = bool(self_consumption)
 
         # ---- 运行状态
         self.reset(soc_init=soc_init)
@@ -187,6 +189,13 @@ class HybridInverter:
         plan_mag = abs(plan)
         inv_max = self.inv_power_limit_kw
 
+        # 图3 自发自用：忽略 TOU 计划、防逆流（不馈网）
+        self_use = bool(self.self_consumption)
+        if self_use:
+            F = 0.0
+            plan = 0.0
+            plan_mag = 0.0
+
         b_min, b_max = self._clamp_battery(dt_h)     # 本步电池允许范围（负=充，正=放）
         chg_cap = max(-b_min, 0.0)                   # 充电能力（≤1 倍额定 + SOC 余量）
         dis_cap = max(b_max, 0.0)                    # 放电能力
@@ -231,6 +240,8 @@ class HybridInverter:
                 if pv_excess2bat > 0.0:                # 富余超馈网上限将充电 → 放电只补负载缺口
                     d = min(d, deficit)
                 d = min(d, dis_cap)
+            elif self_use and dis_cap > 0.0:
+                d = min(deficit, dis_cap)               # 自发自用：电池补负载缺口
 
             # TOU 充电计划：光伏已充后不足部分由电网补足；总取电(负载+充电) ≤ I
             c_grid = 0.0
